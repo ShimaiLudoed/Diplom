@@ -4,8 +4,13 @@ using UnityEngine;
 public class UltraMovementController : MonoBehaviour
 {
     [Header("Refs")]
-    [Tooltip("Камера от 1-го лица (дочерний объект)")]
     public Transform cameraPivot;
+
+    // >>> NEW: Exploration mode <<<
+    [Header("Mode")]
+    [Tooltip("Режим исследования: без дэша, слэма и слайда; медленная ходьба; присед без слайда")]
+    public bool explorationMode = false;
+    public float exploreSpeed = 6f;
 
     [Header("Move")]
     public float runSpeed = 16.5f;
@@ -23,53 +28,60 @@ public class UltraMovementController : MonoBehaviour
 
     [Header("Slide / Crouch")]
     public KeyCode crouchKey = KeyCode.LeftControl;
-    public float slideSpeed = 24f;
-    public float slideFriction = 10f;
-    public float slideMinTime = 0.18f;
-    [Tooltip("Опускание камеры при слайде")]
+    public float slideStartSpeed = 6f;      // мин. гориз. скорость для старта слайда
+    public float slideSpeed = 24f;          // импульс старта слайда
+    public float slideFriction = 6f;        // меньше = дольше скользим
+    public float slideMinTime = 0.22f;      // минимум держим слайд
     public float slideCamYOffset = -0.45f;
-    [Tooltip("Опускание камеры при приседе")]
     public float crouchCamYOffset = -0.35f;
     public float camLerp = 12f;
-    [Tooltip("Высота контроллера в приседе")]
     public float crouchHeight = 1.2f;
+
+    [Header("Slide Cancel")]
+    public bool allowSlideCancel = true;
+    public bool preserveSlideMomentumOnCancel = true;
+    public float slideCancelCarryTime = 0.15f;
+
+    [Header("Crouch Safety")]
+    public float standUpExtra = 0.05f;
+    public LayerMask headHitMask = ~0;
+    public float crouchStepOffset = 0.00f;  // без «подпрыга» в приседе
 
     [Header("Slam")]
     public float slamSpeed = 100f;
 
     [Header("Wall Cling / Jump")]
-    public LayerMask wallLayer;               // ← назначь слой стен здесь
+    public LayerMask wallLayer;
     public float wallCheckRadius = 0.4f;
     public float wallCheckDistance = 0.6f;
     public float wallClingFallSpeed = -5f;
     public int   maxWallJumps = 3;
     public float wallJumpHorizontal = 12f;
     public float wallJumpHeight = 2f;
-    [Tooltip("Макс. вертикал. составляющая нормали, чтобы считать поверхность стеной")]
     [Range(0f,1f)] public float wallMinDot = 0.2f;
 
     [Header("Mouse Look")]
-    public float mouseSensitivity = 100f;
-    public float pitchMin = -90f;
-    public float pitchMax = 90f;
+    public float mouseSensitivity = 0.12f;  // RAW, без deltaTime
+    public float pitchMin = -90f, pitchMax = 90f;
 
     // internals
     CharacterController cc;
-    Vector3 vel;                // хранит вертикаль
-    Vector3 dashVel;            // добавка рывка
-    Vector3 slideVel;           // скорость слайда
+    Vector3 vel;                 // вертикаль
+    Vector3 dashVel;             // добавка рывка
+    Vector3 slideVel;            // скорость слайда
     float dashT, dashCD;
     bool isSliding;
     bool isCrouching;
     float slideT;
     float baseCamY;
-    float pitch;
+    float pitch, mouseX, mouseY;
     bool grounded;
     int wallJumpsLeft;
     Vector3 lastWallNormal;
     bool wallTouch;
     float defaultHeight;
     Vector3 defaultCenter;
+    float defaultStepOffset;
 
     void Start()
     {
@@ -79,24 +91,19 @@ public class UltraMovementController : MonoBehaviour
         baseCamY = cameraPivot.localPosition.y;
         defaultHeight = cc.height;
         defaultCenter = cc.center;
+        defaultStepOffset = cc.stepOffset;
 
-        Cursor.lockState = CursorLockMode.Locked; // см. доки по lockState
-        Cursor.visible = false;                   // курсор скрыт в Locked. :contentReference[oaicite:1]{index=1}
+        Cursor.lockState = CursorLockMode.Locked;
+        Cursor.visible = false;
 
         wallJumpsLeft = maxWallJumps;
     }
 
     void Update()
     {
-        // Mouse look
-        if (Cursor.lockState == CursorLockMode.Locked)
-        {
-            float mx = Input.GetAxis("Mouse X") * mouseSensitivity * Time.deltaTime;
-            float my = Input.GetAxis("Mouse Y") * mouseSensitivity * Time.deltaTime;
-            pitch = Mathf.Clamp(pitch - my, pitchMin, pitchMax);
-            cameraPivot.localRotation = Quaternion.Euler(pitch, 0f, 0f);
-            transform.Rotate(Vector3.up * mx, Space.Self);
-        }
+        // --- RAW mouse input (только чтение) ---
+        mouseX = Input.GetAxisRaw("Mouse X");
+        mouseY = Input.GetAxisRaw("Mouse Y");
 
         grounded = cc.isGrounded;
         if (grounded && vel.y < 0f) { vel.y = -2f; wallJumpsLeft = maxWallJumps; }
@@ -109,36 +116,38 @@ public class UltraMovementController : MonoBehaviour
         bool hasMove = inputMag > inputDeadzone;
         Vector3 wishDir = (transform.right * ix + transform.forward * iz).normalized;
 
-        // Crouch/Slide state machine
-        if (grounded)
+        // --- Crouch / Slide ---
+        bool crouchDown = Input.GetKeyDown(crouchKey);
+        bool crouchHeld = Input.GetKey(crouchKey);
+        bool crouchUp   = Input.GetKeyUp(crouchKey);
+
+        // Gating по режиму
+        bool slideAllowed = !explorationMode;
+        bool dashAllowed  = !explorationMode;
+        bool slamAllowed  = !explorationMode;
+
+        // старт слайда — только по KeyDown и при достаточной скорости
+        if (slideAllowed && grounded && !isSliding && crouchDown && hasMove && CurrentHorizSpeed() >= slideStartSpeed)
+            StartSlide(wishDir);
+
+        // удерживаемый присед (в exploration — всегда по удержанию)
+        if (grounded && !isSliding)
         {
-            // начало слайда только в движении
-            if (!isSliding && Input.GetKeyDown(crouchKey) && hasMove)
-                StartSlide(wishDir);
-
-            // начало приседа при стоянии на месте
-            if (!isSliding && Input.GetKey(crouchKey) && !hasMove)
-                SetCrouch(true);
-
-            // если держим ctrl во время бега — начнётся слайд,
-            // по окончании — останемся в приседе, если ctrl ещё зажат.
+            if (crouchHeld && (!slideAllowed || !hasMove)) EnsureCrouch();
+            if (crouchUp) TryStand();
         }
-
-        // выход из приседа при отпускании ctrl (если не слайдим)
-        if (!isSliding && isCrouching && Input.GetKeyUp(crouchKey))
-            SetCrouch(false);
 
         // Jump / Wall jump / Slam
         if (Input.GetButtonDown("Jump"))
         {
+            if (isSliding && slideAllowed && allowSlideCancel) CancelSlideEarly(); // отмена слайда прыжком
             if (grounded) Jump(ref vel, jumpHeight);
             else if (wallTouch && wallJumpsLeft > 0) WallJump(ref vel);
         }
-        if (!grounded && Input.GetKeyDown(crouchKey))
-            Slam();
+        if (!grounded && crouchDown && slamAllowed) Slam();
 
-        // Dash — разрешён только в движении
-        if (Input.GetKeyDown(dashKey) && dashCD <= 0f && hasMove)
+        // Dash — только в движении
+        if (dashAllowed && Input.GetKeyDown(dashKey) && dashCD <= 0f && hasMove)
             StartDash(wishDir);
 
         // Horizontal move
@@ -146,21 +155,27 @@ public class UltraMovementController : MonoBehaviour
 
         if (isSliding)
         {
+            // ранний выход из слайда по отпусканию Ctrl
+            if (slideAllowed && allowSlideCancel && Input.GetKeyUp(crouchKey))
+                CancelSlideEarly();
+
             slideT += Time.deltaTime;
+
             // трение слайда
             slideVel = Vector3.MoveTowards(slideVel, Vector3.zero, slideFriction * Time.deltaTime);
             horiz += slideVel;
 
-            // переход в присед после слайда, если ctrl держится, иначе выходим
-            if (slideT >= slideMinTime && (slideVel.sqrMagnitude < 0.1f || !hasMove))
+            // авто-завершение
+            if (slideT >= slideMinTime && slideVel.sqrMagnitude < 0.05f)
             {
                 EndSlide();
-                if (Input.GetKey(crouchKey)) SetCrouch(true);
+                if (crouchHeld) EnsureCrouch(); else TryStand();
             }
         }
         else
         {
-            float speed = isCrouching ? crouchSpeed : runSpeed;
+            float baseSpeed = explorationMode ? exploreSpeed : runSpeed;
+            float speed = isCrouching ? Mathf.Min(crouchSpeed, baseSpeed) : baseSpeed;
             float control = grounded ? 1f : airControl;
             horiz += wishDir * (speed * control * inputMag);
         }
@@ -169,22 +184,22 @@ public class UltraMovementController : MonoBehaviour
         if (dashT > 0f)
         {
             dashT -= Time.deltaTime;
-            horiz += dashVel;
+            if (dashAllowed) horiz += dashVel;
             if (dashT <= 0f) dashVel = Vector3.zero;
         }
         if (dashCD > 0f) dashCD -= Time.deltaTime;
 
         // Wall probe + gravity
-        WallProbe(); // обновляет wallTouch/lastWallNormal
+        WallProbe();
         if (!grounded)
         {
-            if (wallTouch && vel.y < 0f) vel.y = wallClingFallSpeed; // «прилипание»
+            if (wallTouch && vel.y < 0f) vel.y = wallClingFallSpeed;
             else vel.y += gravity * Time.deltaTime;
         }
 
         // Move
         Vector3 motion = (horiz + new Vector3(0, vel.y, 0)) * Time.deltaTime;
-        cc.Move(motion); // возврат CollisionFlags можно читать при необходимости. :contentReference[oaicite:2]{index=2}
+        cc.Move(motion);
 
         // Camera Y lerp
         float targetY =
@@ -197,10 +212,21 @@ public class UltraMovementController : MonoBehaviour
         cameraPivot.localPosition = cp;
     }
 
+    void LateUpdate()
+    {
+        if (Cursor.lockState != CursorLockMode.Locked) return;
+
+        // камера
+        pitch = Mathf.Clamp(pitch - mouseY * mouseSensitivity, pitchMin, pitchMax);
+        cameraPivot.localRotation = Quaternion.Euler(pitch, 0f, 0f);
+
+        // тело — после Move, без deltaTime
+        transform.Rotate(0f, mouseX * mouseSensitivity, 0f, Space.Self);
+    }
+
     // --- Actions ---
     void StartDash(Vector3 wishDir)
     {
-        // если ввода нет — не дэшить
         if (wishDir.sqrMagnitude < 0.01f) return;
         dashVel = wishDir.normalized * dashSpeed;
         dashT = dashTime;
@@ -211,9 +237,17 @@ public class UltraMovementController : MonoBehaviour
     {
         isSliding = true;
         slideT = 0f;
-        SetCrouch(false); // на время слайда уходим из стат. приседа
-        // стартовый импульс по текущему направлению
-        slideVel = wishDir.normalized * slideSpeed;
+
+        // уменьшаем капсулу для прохода под низкими объектами
+        SetCrouchCapsule(true);
+
+        // импульс = max(текущая гориз. скорость, slideSpeed)
+        Vector3 cur = HorizontalFrom(cc.velocity);
+        float startSpeed = Mathf.Max(cur.magnitude, slideSpeed);
+        slideVel = wishDir.normalized * startSpeed;
+
+        // прижать к земле
+        vel.y = -2f;
     }
 
     void EndSlide()
@@ -222,23 +256,68 @@ public class UltraMovementController : MonoBehaviour
         slideVel = Vector3.zero;
     }
 
-    void SetCrouch(bool state)
+    void CancelSlideEarly()
     {
-        if (isCrouching == state) return;
-        isCrouching = state;
+        if (!isSliding) return;
 
-        // аккуратно меняем высоту капсулы, не проваливаясь в пол
-        if (state)
+        Vector3 carry = slideVel;   // запомним остаток импульса
+        EndSlide();
+
+        if (!explorationMode && preserveSlideMomentumOnCancel && carry.sqrMagnitude > 0.0001f)
         {
-            cc.height = crouchHeight;
-            cc.center = new Vector3(defaultCenter.x, crouchHeight * 0.5f, defaultCenter.z);
+            dashVel = carry;
+            dashT = Mathf.Max(dashT, slideCancelCarryTime);
+        }
+
+        // отпущен Ctrl — пробуем встать; если низкий потолок — остаёмся присев
+        int playerLayer = gameObject.layer;
+        int mask = headHitMask & ~(1 << playerLayer);
+        if (CanStandFromCurrentFeet(mask)) SetCrouchCapsule(false);
+        else EnsureCrouch();
+    }
+
+    void EnsureCrouch()
+    {
+        if (isCrouching) return;
+        SetCrouchCapsule(true);
+    }
+
+    void TryStand()
+    {
+        if (!isCrouching) return;
+
+        int playerLayer = gameObject.layer;
+        int mask = headHitMask & ~(1 << playerLayer);
+
+        if (CanStandFromCurrentFeet(mask))
+            SetCrouchCapsule(false);
+    }
+
+    void SetCrouchCapsule(bool crouch)
+    {
+        if (crouch)
+        {
+            if (!isCrouching)
+            {
+                SafeSetHeightKeepingFeet(crouchHeight);
+                isCrouching = true;
+                cc.stepOffset = crouchStepOffset;   // без подъёма на ступени
+                vel.y = Mathf.Min(vel.y, -2f);      // прижим
+            }
         }
         else
         {
-            cc.height = defaultHeight;
-            cc.center = defaultCenter;
+            if (isCrouching)
+            {
+                SafeSetHeightKeepingFeet(defaultHeight);
+                isCrouching = false;
+                cc.stepOffset = defaultStepOffset;
+            }
         }
     }
+
+    float CurrentHorizSpeed() => HorizontalFrom(cc.velocity).magnitude;
+    static Vector3 HorizontalFrom(Vector3 v) { v.y = 0f; return v; }
 
     void Slam() { vel.y = -Mathf.Abs(slamSpeed); }
 
@@ -252,7 +331,6 @@ public class UltraMovementController : MonoBehaviour
 
         v.y = Mathf.Sqrt(wallJumpHeight * -2f * gravity);
 
-        // короткий горизонтальный импульс от стены
         dashVel = (-horiz * wallJumpHorizontal);
         dashT = 0.12f;
 
@@ -285,7 +363,6 @@ public class UltraMovementController : MonoBehaviour
 
     void OnControllerColliderHit(ControllerColliderHit hit)
     {
-        // боковые касания для cling
         if (((cc.collisionFlags & CollisionFlags.Sides) != 0) && ((wallLayer.value & (1 << hit.collider.gameObject.layer)) != 0))
         {
             float dotUp = Mathf.Abs(Vector3.Dot(hit.normal, Vector3.up));
@@ -295,5 +372,46 @@ public class UltraMovementController : MonoBehaviour
                 lastWallNormal = hit.normal;
             }
         }
+    }
+
+    // --- Capsule helpers (режем сверху, без провалов) ---
+    void SafeSetHeightKeepingFeet(float newHeight)
+    {
+        newHeight = Mathf.Max(newHeight, cc.radius * 2f + 0.01f);
+
+        Vector3 bottom = BottomSphereWorld(cc.center, cc.height, cc.radius);
+
+        bool prevDetect = cc.detectCollisions;
+        cc.detectCollisions = false;
+        cc.height = newHeight;
+
+        float newCenterYLocal =
+            (bottom - transform.position).y + (cc.height * 0.5f - cc.radius);
+
+        cc.center = new Vector3(defaultCenter.x, newCenterYLocal, defaultCenter.z);
+        cc.detectCollisions = prevDetect;
+
+        cc.Move(Vector3.down * 0.001f);
+    }
+
+    bool CanStandFromCurrentFeet(int mask)
+    {
+        Vector3 bottom = BottomSphereWorld(cc.center, cc.height, cc.radius);
+        Vector3 top    = TopSphereWorldFromBottom(bottom, defaultHeight, cc.radius);
+        top += Vector3.up * standUpExtra;
+
+        float radius = Mathf.Max(cc.radius - cc.skinWidth, 0.001f);
+        return !Physics.CheckCapsule(bottom, top, radius, mask, QueryTriggerInteraction.Ignore);
+    }
+
+    Vector3 BottomSphereWorld(Vector3 centerLocal, float height, float radius)
+    {
+        Vector3 worldCenter = transform.position + centerLocal;
+        return worldCenter + Vector3.down * (height * 0.5f - radius);
+    }
+
+    Vector3 TopSphereWorldFromBottom(Vector3 bottomSphereWorld, float height, float radius)
+    {
+        return bottomSphereWorld + Vector3.up * (height - 2f * radius);
     }
 }
